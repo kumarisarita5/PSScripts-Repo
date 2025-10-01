@@ -33,7 +33,7 @@ Write-Output $CRLF
 # Setup the vault context
 $message = 'Setting Vault context using vault {0} under resource group {1} in subscription {2}.' -f $VaultName, $VaultResourceGroupName, $VaultSubscriptionId
 Write-Output $message
-Set-AzContext -SubscriptionId $VaultSubscriptionId
+Select-AzSubscription -SubscriptionId $VaultSubscriptionId
 $vault = Get-AzRecoveryServicesVault -ResourceGroupName $VaultResourceGroupName -Name $VaultName
 Set-AzRecoveryServicesAsrVaultContext -vault $vault
 $message = 'Vault context set.'
@@ -358,5 +358,6 @@ foreach ($key in $DeploymentScriptOutputs.Keys) {
     $message = '{0} : {1}' -f $key, $DeploymentScriptOutputs[$key]
     Write-Output $message
 }
+
 
 
