@@ -8,8 +8,8 @@ param(
     [string] $SourceVmARMIdsCSV,
     [string] $TargetResourceGroupId,
     [string] $TargetVirtualNetworkId,
-    [string] $SourceAvailabilityZone = "1",
-    [string] $TargetAvailabilityZone = "2",
+    [string] $SourceAvailabilityZone = "2",
+    [string] $TargetAvailabilityZone = "1",
     [string] $PrimaryStagingStorageAccount,
     [string] $RecoveryReplicaDiskAccountType = 'Standard_LRS',
     [string] $RecoveryTargetDiskAccountType = 'Standard_LRS'
