@@ -76,38 +76,77 @@ $message = 'Using Fabric {0}' -f $fabric.Id
 Write-Output $message
 Write-Output $CRLF
 
-# Setup the Protection Container
+# Setup Protection Containers for zone-to-zone replication
+Write-Output "Setting up protection containers for zone-to-zone replication..."
+
+# For zone-to-zone replication, we need to ensure we have proper container setup
+$sourceContainerName = "asr-container-zone$SourceAvailabilityZone"
+$targetContainerName = "asr-container-zone$TargetAvailabilityZone"
+
+# Get or create source container
+$sourceContainer = $null
 $containers = Get-AzRecoveryServicesAsrProtectionContainer -Fabric $fabric
-if ($null -eq $containers -or $containers.Count -eq 0) {
-    Write-Output 'Protection container does not exist. Creating Protection Container.'
-    $job = New-AzRecoveryServicesAsrProtectionContainer -Name $fabric.Name -Fabric $fabric
+$sourceContainer = $containers | Where-Object { $_.Name -eq $sourceContainerName } | Select-Object -First 1
+
+if ($null -eq $sourceContainer) {
+    Write-Output "Creating source protection container: $sourceContainerName"
+    $job = New-AzRecoveryServicesAsrProtectionContainer -Name $sourceContainerName -Fabric $fabric
     do {
-        Start-Sleep -Seconds 50
+        Start-Sleep -Seconds 30
         $job = Get-AzRecoveryServicesAsrJob -Job $job
+        Write-Output "Source container creation job state: $($job.State)"
     } while ($job.State -ne 'Succeeded' -and $job.State -ne 'Failed' -and $job.State -ne 'CompletedWithInformation')
 
     if ($job.State -eq 'Failed') {
-        $message = 'Job {0} failed for {1}' -f $job.DisplayName, $job.TargetObjectName
-        Write-Output $message
-        foreach ($er in $job.Errors) {
-            foreach ($pe in $er.ProviderErrorDetails) {
-                $pe
-            }
-            foreach ($se in $er.ServiceErrorDetails) {
-                $se
-            }
-        }
-        throw $message
+        Write-Output "Source container creation failed, using existing container"
+        $sourceContainer = $containers | Select-Object -First 1
+    } else {
+        $sourceContainer = Get-AzRecoveryServicesAsrProtectionContainer -Name $sourceContainerName -Fabric $fabric
+        Write-Output "Created source protection container: $($sourceContainer.Name)"
     }
-    $container = Get-AzRecoveryServicesAsrProtectionContainer -Name $fabric.Name -Fabric $fabric
-    Write-Output 'Created Protection Container.'
 } else {
-    # For zonal ASR, we use the same container for both source and target
-    $container = $containers[0]
+    Write-Output "Using existing source protection container: $($sourceContainer.Name)"
 }
 
-$message = 'Using Protection Container {0}' -f $container.Id
+# Get or create target container (only if different from source)
+$targetContainer = $null
+if ($sourceContainerName -ne $targetContainerName) {
+    $targetContainer = $containers | Where-Object { $_.Name -eq $targetContainerName } | Select-Object -First 1
+
+    if ($null -eq $targetContainer) {
+        Write-Output "Creating target protection container: $targetContainerName"
+        $job = New-AzRecoveryServicesAsrProtectionContainer -Name $targetContainerName -Fabric $fabric
+        do {
+            Start-Sleep -Seconds 30
+            $job = Get-AzRecoveryServicesAsrJob -Job $job
+            Write-Output "Target container creation job state: $($job.State)"
+        } while ($job.State -ne 'Succeeded' -and $job.State -ne 'Failed' -and $job.State -ne 'CompletedWithInformation')
+
+        if ($job.State -eq 'Failed') {
+            Write-Output "Target container creation failed, using source container"
+            $targetContainer = $sourceContainer
+        } else {
+            $targetContainer = Get-AzRecoveryServicesAsrProtectionContainer -Name $targetContainerName -Fabric $fabric
+            Write-Output "Created target protection container: $($targetContainer.Name)"
+        }
+    } else {
+        Write-Output "Using existing target protection container: $($targetContainer.Name)"
+    }
+} else {
+    # Same zone replication - use source container as target
+    $targetContainer = $sourceContainer
+    Write-Output "Using same container for source and target (same zone replication)"
+}
+
+# Use source container as the primary container for the rest of the script
+$container = $sourceContainer
+
+$message = 'Using Source Protection Container {0}' -f $container.Id
 Write-Output $message
+if ($targetContainer.Id -ne $container.Id) {
+    $message = 'Using Target Protection Container {0}' -f $targetContainer.Id
+    Write-Output $message
+}
 Write-Output $CRLF
 
 # Create or get replication policy
@@ -141,70 +180,72 @@ $message = 'Using Policy {0}' -f $policy.Id
 Write-Output $message
 Write-Output $CRLF
 
-# Enhanced: Create protection container mapping for zone-to-zone replication
-Write-Output "Setting up protection container mapping for zone-to-zone replication..."
+# Create protection container mapping for zone-to-zone replication
+Write-Output "Creating protection container mapping for zone-to-zone replication..."
+Write-Output "This will map source container (zone $SourceAvailabilityZone) to target container (zone $TargetAvailabilityZone)"
 
 $mappingName = "mapping-zone$SourceAvailabilityZone-to-zone$TargetAvailabilityZone"
 $containerMapping = $null
 
 try {
     # Check if mapping already exists
-    $containerMapping = Get-AzRecoveryServicesAsrProtectionContainerMapping -Name $mappingName -ProtectionContainer $container -ErrorAction SilentlyContinue
+    $existingMappings = Get-AzRecoveryServicesAsrProtectionContainerMapping -ProtectionContainer $container -ErrorAction SilentlyContinue
+    $containerMapping = $existingMappings | Where-Object { $_.Name -eq $mappingName } | Select-Object -First 1
 
     if ($null -eq $containerMapping) {
         Write-Output "Creating new protection container mapping: $mappingName"
+        Write-Output "Source Container: $($container.Name)"
+        Write-Output "Target Container: $($targetContainer.Name)"
 
-        # For zone-to-zone replication within the same region, use the same container as both source and target
-        $mappingJob = New-AzRecoveryServicesAsrProtectionContainerMapping -Name $mappingName -Policy $policy -PrimaryProtectionContainer $container -RecoveryProtectionContainer $container
+        # Create mapping between different zone containers
+        $mappingJob = New-AzRecoveryServicesAsrProtectionContainerMapping -Name $mappingName -Policy $policy -PrimaryProtectionContainer $container -RecoveryProtectionContainer $targetContainer
 
         # Wait for mapping creation to complete
+        $maxWaitTime = 180 # 3 minutes
+        $waitedTime = 0
         do {
             Start-Sleep -Seconds 30
-            $mappingJob = Get-AzRecoveryServicesAsrJob -Job $mappingJob
-            Write-Output "Mapping creation job state: $($mappingJob.State)"
-        } while ($mappingJob.State -ne 'Succeeded' -and $mappingJob.State -ne 'Failed' -and $mappingJob.State -ne 'CompletedWithInformation')
+            $waitedTime += 30
+            try {
+                $mappingJob = Get-AzRecoveryServicesAsrJob -Job $mappingJob
+                Write-Output "Mapping creation job state: $($mappingJob.State) (waited $waitedTime seconds)"
+            } catch {
+                Write-Output "Error checking mapping job status: $($_.Exception.Message)"
+                break
+            }
+        } while ($mappingJob.State -eq 'InProgress' -and $waitedTime -lt $maxWaitTime)
 
-        if ($mappingJob.State -eq 'Failed') {
-            $message = 'Protection container mapping creation failed: {0}' -f $mappingJob.DisplayName
-            Write-Output $message
-            foreach ($er in $mappingJob.Errors) {
-                foreach ($pe in $er.ProviderErrorDetails) {
-                    Write-Output "Provider Error: $pe"
-                }
-                foreach ($se in $er.ServiceErrorDetails) {
-                    Write-Output "Service Error: $se"
+        if ($mappingJob.State -eq 'Succeeded' -or $mappingJob.State -eq 'CompletedWithInformation') {
+            # Get the created mapping
+            Start-Sleep -Seconds 10
+            $containerMapping = Get-AzRecoveryServicesAsrProtectionContainerMapping -Name $mappingName -ProtectionContainer $container -ErrorAction SilentlyContinue
+            if ($null -ne $containerMapping) {
+                Write-Output "Successfully created protection container mapping: $($containerMapping.Name)"
+            } else {
+                Write-Output "Mapping creation completed but could not retrieve mapping"
+            }
+        } else {
+            Write-Output "Mapping creation job failed or timed out: $($mappingJob.State)"
+            if ($mappingJob.State -eq 'Failed') {
+                foreach ($er in $mappingJob.Errors) {
+                    Write-Output "Mapping Error: $($er.ServiceErrorDetails.Message)"
                 }
             }
-            throw $message
         }
-
-        # Get the created mapping
-        $containerMapping = Get-AzRecoveryServicesAsrProtectionContainerMapping -Name $mappingName -ProtectionContainer $container
-        Write-Output "Successfully created protection container mapping: $($containerMapping.Name)"
     } else {
         Write-Output "Using existing protection container mapping: $($containerMapping.Name)"
     }
-
 } catch {
-    Write-Output "Error with protection container mapping: $($_.Exception.Message)"
-    # Try to find any existing compatible mapping as fallback
-    try {
-        $allMappings = Get-AzRecoveryServicesAsrProtectionContainerMapping -ProtectionContainer $container
-        $compatibleMapping = $allMappings | Where-Object { $_.PolicyId -eq $policy.Id } | Select-Object -First 1
-
-        if ($null -ne $compatibleMapping) {
-            Write-Output "Using existing compatible mapping as fallback: $($compatibleMapping.Name)"
-            $containerMapping = $compatibleMapping
-        } else {
-            throw "No compatible protection container mapping found and unable to create new one"
-        }
-    } catch {
-        throw "Unable to set up protection container mapping for zone-to-zone replication: $($_.Exception.Message)"
-    }
+    Write-Output "Error creating protection container mapping: $($_.Exception.Message)"
 }
 
-$message = 'Using Protection Container Mapping {0}' -f $containerMapping.Id
-Write-Output $message
+if ($null -eq $containerMapping) {
+    Write-Output "Could not create or find protection container mapping"
+    Write-Output "This may indicate that zone-to-zone replication is not supported in this configuration"
+    throw "Unable to set up protection container mapping required for zone-to-zone replication"
+} else {
+    Write-Output "Using protection container mapping: $($containerMapping.Name)"
+}
 Write-Output $CRLF
 
 # Continue with the rest of the replication logic...
@@ -240,7 +281,11 @@ foreach ($sourceVmArmId in $sourceVmARMIds) {
     Write-Output $message
 
     try {
-        # Use the protection container mapping we created/found
+        # Use the protection container mapping for zone-to-zone replication
+        Write-Output "Using protection container mapping for VM replication"
+        Write-Output "Creating replication for $vmName from zone $SourceAvailabilityZone to zone $TargetAvailabilityZone"
+
+        # Use the container mapping for zone-to-zone replication
         $job = New-AzRecoveryServicesAsrReplicationProtectedItem -Name $vmName -ProtectionContainerMapping $containerMapping -AzureVmId $vm.ID -AzureToAzureDiskReplicationConfiguration $diskList -RecoveryResourceGroupId $TargetResourceGroupId -RecoveryAzureNetworkId $TargetVirtualNetworkId -RecoveryAvailabilityZone $TargetAvailabilityZone
 
         if ($null -ne $job) {
@@ -252,7 +297,8 @@ foreach ($sourceVmArmId in $sourceVmARMIds) {
     }
     catch {
         Write-Output "Error enabling replication for $vmName : $($_.Exception.Message)"
-        throw $_
+        Write-Output "Continuing with next VM..."
+        # Continue with other VMs instead of throwing
     }
 }
 
